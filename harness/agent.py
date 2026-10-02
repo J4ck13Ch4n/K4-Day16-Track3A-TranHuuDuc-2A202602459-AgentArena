@@ -100,6 +100,34 @@ The ~700 prompt tokens per call ARE a real cost on a real endpoint, and
 the scored round's per-brief `max_tokens` is sized with them included. If
 you switch the addendum on, measure your own efficiency delta with
 `scripts/run_practice.py --prompt-addendum` before assuming it is free.
+
+A PROMPT IS ADVISORY; THIS GUARD IS NOT
+========================================
+
+`REAL_MODEL_PROMPT_ADDENDUM` clause A ASKS a real endpoint to search
+before abstaining. Measured on live keys, asking was not enough:
+gpt-5.6-luna abstained on turn 1 with ZERO tool calls on 4 of 6 runs;
+deepseek-v4-flash on 6 of 6. Zero tools -> zero claims -> the abstain
+floor, regardless of what the system prompt says, because an endpoint
+is free to ignore a system prompt.
+
+So `run()` now enforces the same rule at the control-flow layer, where
+an endpoint cannot ignore it: a FINAL carrying `abstain: true` while
+`ctx.tools.calls == 0` is REFUSED — exactly like a quoted protocol
+template — and the model is told why
+(`PREMATURE_ABSTAIN_NUDGE`) instead of being allowed to end the run.
+Bounded by `MAX_PREMATURE_ABSTAIN_DEFERRALS` for the same reason
+`MAX_FINAL_DEFERRALS` is bounded: a model that insists on abstaining
+with zero evidence must still be allowed to finish eventually, and the
+existing `_refused_final` fallback already guarantees the LAST refusal
+is submitted rather than lost, so this guard can only ever buy turns,
+never cost the run its report.
+
+This never fires on `MockModel`, which always searches before writing a
+FINAL (see `test_neither_parse_guard_ever_fires_on_an_honest_run()`'s
+sibling coverage in `tests/test_middleware.py`) — it exists entirely for
+the real-model path, where the single model call this module's docstring
+used to only WARN about is now something the loop actively prevents.
 """
 
 from __future__ import annotations
@@ -152,6 +180,29 @@ REPORT_KEYS = ("answer", "claims", "abstain", "citations")
 #: appends an ACTION to every FINAL would otherwise never be allowed to
 #: finish. After this many deferrals the FINAL is taken at face value.
 MAX_FINAL_DEFERRALS = 2
+
+#: How many times ONE RUN may refuse an `abstain: true` FINAL written
+#: before the model has called a single tool. `REAL_MODEL_PROMPT_ADDENDUM`
+#: ASKS a real endpoint to search before abstaining; this is the part that
+#: ENFORCES it when the endpoint ignores the prompt — measured on live
+#: keys: gpt-5.6-luna abstained on turn 1 with zero tool calls on 4 of 6
+#: runs, deepseek-v4-flash on 6 of 6. A prompt is advisory; a control-flow
+#: guard is not. Bounded for the same reason as `MAX_FINAL_DEFERRALS`: a
+#: model that insists on abstaining forever must still be allowed to
+#: finish eventually, and the existing `_refused_final` fallback already
+#: guarantees the last refusal is submitted rather than lost.
+MAX_PREMATURE_ABSTAIN_DEFERRALS = 2
+
+#: What `_observe` shows the model after a premature abstain is refused.
+#: Specific on purpose — the generic "không đọc được ACTION" message does
+#: not say WHY the FINAL was rejected, and a real model correcting from
+#: feedback needs the actual reason, not a parse-error message that does
+#: not apply here.
+PREMATURE_ABSTAIN_NUDGE = (
+    f"{TOOL_ERROR_PREFIX} bạn kết luận \"không đủ căn cứ\" (abstain) mà chưa gọi "
+    "một công cụ nào. Hãy gọi search trước, đọc toàn văn tài liệu liên quan bằng "
+    "fetch_doc, rồi mới được kết luận."
+)
 
 #: What a model writes where CONTENT belongs when it is QUOTING the
 #: protocol instead of answering: the template's own `...`, an ellipsis,
@@ -487,6 +538,7 @@ class ReActAgent:
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._premature_abstain_deferrals = 0
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +555,7 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._premature_abstain_deferrals = 0
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -532,6 +585,24 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
+                if self._is_premature_abstain(ctx, parsed.final):
+                    # The model gave up with zero evidence. Refuse the
+                    # FINAL at the control-flow layer, not the prompt
+                    # layer: `REAL_MODEL_PROMPT_ADDENDUM` ASKS a real
+                    # endpoint to search first, but an endpoint that
+                    # ignores it (measured: gpt-5.6-luna 4/6, deepseek
+                    # 6/6 zero-tool-call abstentions) still has to be
+                    # stopped by CODE. Remember it like any other
+                    # refused FINAL, so a run that abstains forever still
+                    # submits something instead of an empty report.
+                    self._refused_final = (
+                        parsed.final if isinstance(parsed.final, dict) else {}
+                    )
+                    self._premature_abstain_deferrals += 1
+                    observation = PREMATURE_ABSTAIN_NUDGE
+                    ctx.observations.append(observation)
+                    ctx.messages.append({"role": "user", "content": observation})
+                    continue
                 report = parsed.final if isinstance(parsed.final, dict) else {}
                 ctx.stop_reason = "final"
                 break
@@ -611,6 +682,31 @@ class ReActAgent:
         # non-canonical marker such as `final: {}` in the first place, and
         # this path exists precisely to look underneath one.
         return parse_output(_without_quoted_finals(text))
+
+    def _is_premature_abstain(self, ctx: AgentContext, final) -> bool:
+        """Is this a zero-evidence `abstain: true` the model should not
+        be allowed to end the run with yet?
+
+        Three conditions, all required, so this can only ever intercept
+        the ONE measured failure (turn-1 abstention) and nothing else:
+
+        1. `abstain` is `True` in the payload — a real answer is never
+           refused, no matter how little evidence backs it; `critic` (§2)
+           owns judging an ANSWERED claim, not this guard.
+        2. Not one tool call has happened yet (`ctx.tools.calls == 0`) —
+           an abstain AFTER a search-and-fetch is an honest "I looked and
+           there is nothing", which is exactly the behaviour the lab
+           wants to keep rewarding.
+        3. Fewer than `MAX_PREMATURE_ABSTAIN_DEFERRALS` refusals have
+           already happened this run — a model that insists on
+           abstaining with no evidence is eventually allowed to, so this
+           can only buy turns, never trap the run forever.
+        """
+        if not isinstance(final, dict) or final.get("abstain") is not True:
+            return False
+        if ctx.tools.calls > 0:
+            return False
+        return self._premature_abstain_deferrals < MAX_PREMATURE_ABSTAIN_DEFERRALS
 
     # -- the model -----------------------------------------------------
 
